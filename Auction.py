@@ -253,8 +253,8 @@ def run_auction(T, bidders, Q, regret_calc):
 def func_test(T_train, T_test):
     Q = 30
     N = 5
-    c_limit = 100
-    d_limit = 50
+    c_limit = 10
+    d_limit = 5
     K = 10
     bidders = []
     for i in range(N):
