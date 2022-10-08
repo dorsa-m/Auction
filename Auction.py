@@ -2,12 +2,27 @@ import numpy as np
 import cvxpy as cp
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF
+from sklearn.metrics import r2_score
 from matplotlib import pyplot as plt
 from tqdm import tqdm
-from sklearn.metrics import r2_score
 import pickle
-import random
+import re
 
+
+# To normalize payoff in [0,1]
+def normalize_util(payoffs, min_payoff, max_payoff):
+    if min_payoff == max_payoff:
+        return payoffs
+    payoff_range = max_payoff - min_payoff
+    payoffs = np.maximum(payoffs, min_payoff)
+    payoffs = np.minimum(payoffs, max_payoff)
+    payoffs_scaled = (payoffs - min_payoff) / payoff_range
+    return payoffs_scaled
+
+
+normalize = np.vectorize(normalize_util)
+
+# a class to store auction data
 class auction_data:
     def __init__(self):
         self.bids = []
@@ -17,10 +32,8 @@ class auction_data:
         self.payoffs = []
         self.regrets = []
 
-
 class Bidder:
-    def __init__(self, c_limit, d_limit, K, has_seed = False):
-        self.learning_rate = 1
+    def __init__(self, c_limit, d_limit, K, has_seed=False):
         self.K = K
         c_list = c_limit * np.random.sample(size=K)
         d_list = d_limit * np.random.sample(size=K)
@@ -52,13 +65,6 @@ class Bidder:
         if self.has_seed:
             self.random_state = np.random.RandomState(seed=self.seed)
 
-    # MWU update rule
-    def update_weights(self, payoffs):
-        payoffs = normalize(payoffs, payoffs.min(), payoffs.max())
-        losses = np.ones(self.K) - np.array(payoffs)
-        self.weights = np.multiply(self.weights, np.exp(np.multiply(self.learning_rate, -losses)))
-        self.weights = self.weights / np.sum(self.weights)
-
     # choose action according to weights
     def choose_action(self):
         mixed_strategies = self.weights / np.sum(self.weights)
@@ -69,54 +75,64 @@ class Bidder:
         return self.action_set[choice], choice
 
 
-# To normalize payoff in [0,1]
-def normalize_util(payoffs, min_payoff, max_payoff):
-    if min_payoff == max_payoff:
-        return payoffs
-    payoff_range = max_payoff - min_payoff
-    payoffs = np.maximum(payoffs, min_payoff)
-    payoffs = np.minimum(payoffs, max_payoff)
-    payoffs_scaled = (payoffs - min_payoff) / payoff_range
-    return payoffs_scaled
-
-
-normalize = np.vectorize(normalize_util)
-
-
 class Hedge_bidder(Bidder):
-    def __init__(self, c_limit, d_limit, K, has_seed = False):
+    def __init__(self, c_limit, d_limit, K, max_payoff, T, has_seed=False):
         super().__init__(c_limit, d_limit, K, has_seed)
         self.type = 'Hedge'
+        self.T = T
+        self.learning_rate = np.sqrt(8 * np.log(self.K) / self.T)
+        self.max_payoff = max_payoff
+
+    def update_weights(self, payoffs):
+        payoffs = normalize(payoffs, 0, self.max_payoff)
+        losses = np.ones(self.K) - np.array(payoffs)
+        self.weights = np.multiply(self.weights, np.exp(np.multiply(self.learning_rate, -losses)))
+        self.weights = self.weights / np.sum(self.weights)
 
 
 class random_bidder(Bidder):
-    def __init__(self, c_limit, d_limit, K, has_seed = False):
+    def __init__(self, c_limit, d_limit, K, has_seed=False):
         super().__init__(c_limit, d_limit, K, has_seed)
         self.type = 'random'
 
 
 class EXP3_bidder(Bidder):
-    def __init__(self, c_limit, d_limit, K, has_seed = False):
+    def __init__(self, c_limit, d_limit, K, max_payoff, T, has_seed=False):
         super().__init__(c_limit, d_limit, K, has_seed)
         self.type = 'EXP3'
-        self.gamma = 0.1
+        self.rewards_est = np.zeros(K)
+        self.T = T
+        self.max_payoff = max_payoff
+
+        delta = 0.01
+        self.beta = np.sqrt(np.log(self.K * (1 / delta)) / (self.T * self.K))
+        self.gamma = 1.05 * np.sqrt(np.log(self.K) * self.K / self.T)
+        self.learning_rate = 0.95 * np.sqrt(np.log(self.K) / (self.T * self.K))
+        assert 0 < self.beta < 1 and 0 < self.gamma < 1
 
     def update_weights(self, played_a, payoff):
-        payoffs = np.zeros(self.K)
-        prob_played_action = (1 - self.gamma) * (self.weights[played_a] / np.sum(self.weights)) + (self.gamma / self.K)
-        payoffs[played_a] = payoff / prob_played_action
-        super().update_weights(payoffs)
+        prob = self.weights[played_a] / np.sum(self.weights)
+        payoff = normalize(payoff, 0, self.max_payoff)
+
+        self.rewards_est = self.rewards_est + self.beta * np.divide(np.ones(self.K),
+                                                                    self.weights / np.sum(self.weights))
+        self.rewards_est[played_a] = self.rewards_est[played_a] + payoff / prob
+
+        self.weights = np.exp(np.multiply(self.learning_rate, self.rewards_est))
+        self.weights = self.weights / np.sum(self.weights)
+        self.weights = (1 - self.gamma) * self.weights + self.gamma / self.K * np.ones(self.K)
 
 
-class GPMW_bidder(Bidder):
-    def __init__(self, c_limit, d_limit, K):
-        super().__init__(c_limit, d_limit, K)
+class GPMW_bidder(Hedge_bidder):
+    def __init__(self, c_limit, d_limit, K, max_payoff, T, beta, has_seed=False):
+        super().__init__(c_limit, d_limit, K, max_payoff, T, has_seed)
         self.type = 'GPMW'
         self.sigma = 0.001
         self.gpr = GaussianProcessRegressor(kernel=RBF(), alpha=self.sigma ** 2)
         self.gpr.optimizer = None
         self.input_history = []
-        self.beta = 1
+        self.beta = beta
+        self.max_payoff = max_payoff
 
     def restart(self):
         self.input_history = []
@@ -134,6 +150,18 @@ class GPMW_bidder(Bidder):
         payoffs = mean + self.beta * std
         super().update_weights(payoffs)
 
+# estimates maximum payoff from results of a random play
+def calc_max_payoff(Q, c_limit, d_limit, N, T, K):
+    num_games = 10
+    num_runs = 10
+    game_data_profile = []
+    for i in range(num_games):
+        bidders = []
+        for i in range(N):
+            bidders.append(random_bidder(c_limit, d_limit, K))
+        for run in range(num_runs):
+            game_data_profile.append(run_auction(T, bidders, Q, regret_calc=False).payoffs)
+    return np.max(np.array(game_data_profile))
 
 # simulates the selection process in the auction
 def optimize_alloc(bids, Q):
@@ -186,7 +214,7 @@ def run_auction(T, bidders, Q, regret_calc):
             bidder.history_payoff.append(payoff_bidder)
         game_data.payoffs.append(payoff)
 
-        # calculates real regret for all bidders
+        # calculates real regret for all bidders/ Hedge also needs this part for its update
         if regret_calc:
             regrets = []
             for i, bidder in enumerate(bidders):
@@ -221,61 +249,6 @@ def run_auction(T, bidders, Q, regret_calc):
 
     return game_data
 
-
-# simulates #num_games different repeated auction #num_runs times for different types and averages each result
-def simulate(num_games, num_runs, T, N, K):
-    Q = 30
-    c_limit = 10
-    d_limit = 5
-    types = []
-    types.append('hedge')
-    types.append('EXP3')
-    types.append('GPMW')
-    types.append('random')
-    game_data_profile = [[] for i in range(len(types))]
-    for j in range(num_games):
-        other_bidders = []
-        for i in range(N - 1):
-            other_bidders.append(random_bidder(c_limit, d_limit, K, True))
-        for type_idx, bidder_type in enumerate(types):
-            if bidder_type == 'hedge':
-                bidders = other_bidders + [Hedge_bidder(c_limit, d_limit, K)]
-            if bidder_type == 'EXP3':
-                bidders = other_bidders + [EXP3_bidder(c_limit, d_limit, K)]
-            if bidder_type == 'GPMW':
-                bidders = other_bidders + [GPMW_bidder(c_limit, d_limit, K)]
-            if bidder_type == 'random':
-                bidders = other_bidders + [random_bidder(c_limit, d_limit, K)]
-            for run in tqdm(range(num_runs)):
-                game_data_profile[type_idx].append(run_auction(T, bidders, Q, True))
-    with open('result.pckl', 'wb') as file:
-        pickle.dump(T, file)
-        pickle.dump(types, file)
-        pickle.dump(game_data_profile, file)
-
-
-# plots the regrets
-def plot():
-    with open('result.pckl', 'rb') as file:
-        T = pickle.load(file)
-        types = pickle.load(file)
-        game_data_profile = pickle.load(file)
-    for i, typ in enumerate(types):
-        data = np.array(
-            [[game_data_profile[i][d].regrets[t][-1] for t in range(T)] for d in range(len(game_data_profile[i]))])
-        mean = np.mean(data, 0)
-        std = np.std(data, 0)
-        p = plt.plot(range(T), mean, label=typ)
-        color = p[0].get_color()
-        plt.fill_between(range(T), mean - std,
-                         mean + std, alpha=0.1,
-                         color=color)
-    plt.legend()
-    plt.xlabel('Time')
-    plt.ylabel('Regret')
-    plt.show()
-
-
 # extra function to train and test the fitness of GPMW prediction
 def func_test(T_train, T_test):
     Q = 30
@@ -285,7 +258,7 @@ def func_test(T_train, T_test):
     K = 10
     bidders = []
     for i in range(N):
-        bidders.append(random_bidder(c_limit, d_limit, K))
+        bidders.append(random_bidder(c_limit, d_limit, K, Q))
 
     # train data
     game_data = run_auction(T_train, bidders, Q, False)
@@ -318,14 +291,83 @@ def func_test(T_train, T_test):
     p = plt.plot(range(T_test), mean)
     plt.fill_between(range(T_test), mean - std,
                      mean + std, alpha=0.1, color=p[0].get_color())
+    plt.title(f'R2 score = {r2_score(payoff_p1, mean)}')
     plt.legend(['real payoff', 'predicted payoff'])
     plt.xlabel('Round')
     plt.ylabel('Payoff')
     plt.show()
 
+# simulates #num_games different repeated auction #num_runs times for different types and averages each result
+def simulate(num_games, num_runs, T, N, K, file_name):
+    Q = 30
+    c_limit = 10
+    d_limit = 5
+    # max_payoff = calc_max_payoff(Q, c_limit, d_limit, N, T, K)
+    # print(max_payoff)
+    max_payoff = 500
+
+    types = []
+    types.append('Hedge')
+    types.append('EXP3')
+    types.append('Random')
+    # types.append('GPMW 0.01')
+    types.append('GPMW 0.1')
+    # types.append('GPMW 1')
+    # types.append('GPMW 10')
+    game_data_profile = [[] for i in range(len(types))]
+    for j in range(num_games):
+        other_bidders = []
+        for i in range(N - 1):
+            other_bidders.append(random_bidder(c_limit, d_limit, K, has_seed=True))
+        for type_idx, bidder_type in enumerate(types):
+            if bidder_type == 'Hedge':
+                bidders = other_bidders + [Hedge_bidder(c_limit, d_limit, K, max_payoff, T)]
+            if bidder_type == 'EXP3':
+                bidders = other_bidders + [EXP3_bidder(c_limit, d_limit, K, max_payoff, T)]
+            match = re.match('(GPMW)\W?(\d+\.?\d*)?', bidder_type)
+            if match:
+                beta = match.groups()[1]
+                if beta:
+                    bidders = other_bidders + [GPMW_bidder(c_limit, d_limit, K, max_payoff, T, float(beta))]
+            if bidder_type == 'Random':
+                bidders = other_bidders + [random_bidder(c_limit, d_limit, K)]
+            for run in tqdm(range(num_runs)):
+                game_data_profile[type_idx].append(run_auction(T, bidders, Q, regret_calc=True))
+    with open(f'{file_name}.pckl', 'wb') as file:
+        pickle.dump(T, file)
+        pickle.dump(c_limit, file)
+        pickle.dump(d_limit, file)
+        pickle.dump(Q, file)
+        pickle.dump(types, file)
+        pickle.dump(game_data_profile, file)
+
+# plots the regrets
+def plot_regret(file_name):
+    with open(f'{file_name}.pckl', 'rb') as file:
+        T = pickle.load(file)
+        c_limit = pickle.load(file)
+        d_limit = pickle.load(file)
+        Q = pickle.load(file)
+        types = pickle.load(file)
+        game_data_profile = pickle.load(file)
+    for i, typ in enumerate(types):
+        data = np.array(
+            [[game_data_profile[i][d].regrets[t][-1] for t in range(T)] for d in range(len(game_data_profile[i]))])
+        mean = np.mean(data, 0)
+        std = np.std(data, 0)
+        p = plt.plot(range(T), mean, label=typ)
+        color = p[0].get_color()
+        plt.fill_between(range(T), mean - std,
+                         mean + std, alpha=0.1,
+                         color=color)
+    plt.legend()
+    plt.xlabel('Time')
+    plt.ylabel('Regret')
+    plt.show()
 
 '''simulation'''
-# func_test(30, 200)
-np.random.seed(12)
-simulate(num_games=2, num_runs=2, T=10, N=8, K=6)
-plot()
+func_test(30, 200)
+# np.random.seed(12)
+# simulate(num_games=20, num_runs=10, T=200, N=6, K=5, file_name='res4')
+# plot_regret('result')
+# plot_payoff_upper_bound()
