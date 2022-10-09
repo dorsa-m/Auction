@@ -369,5 +369,5 @@ def plot_regret(file_name):
 func_test(30, 200)
 # np.random.seed(12)
 # simulate(num_games=20, num_runs=10, T=200, N=6, K=5, file_name='res4')
-# plot_regret('result')
+plot_regret('result')
 # plot_payoff_upper_bound()
